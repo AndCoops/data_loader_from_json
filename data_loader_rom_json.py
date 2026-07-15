@@ -1,134 +1,120 @@
+#!/usr/bin/env python3
+
 import json
-import os
+import re
 import sys
-import xml.etree.ElementTree as ET
 
 import psycopg2
-from pymongo import MongoClient
+from psycopg2.extras import execute_values
+
+from pymongo import MongoClient, UpdateOne
 
 
 # ============================================================
-# CONFIGURATION
+# GENERAL CONFIGURATION
 # ============================================================
 
 INVENTORY_JSON_PATH = "/path/to/jenkins_xml_inventory.json"
 
-# Directory containing the XML files you exported/downloaded.
-XML_ROOT_DIRECTORY = "/path/to/exported/xml/files"
+BATCH_SIZE = 250
 
-
-# PostgreSQL
-POSTGRES_HOST = "postgres-server"
-POSTGRES_PORT = 5432
-POSTGRES_DATABASE = "database_name"
-POSTGRES_USER = "database_user"
-POSTGRES_PASSWORD = "database_password"
-
-POSTGRES_TABLE = "target_table"
-POSTGRES_KEY_COLUMN = "xml_identifier"
-POSTGRES_VALUE_COLUMN = "new_relationship_value"
-
-
-# MongoDB
-MONGO_URI = "mongodb://mongo-user:mongo-password@mongo-server:27017/"
-MONGO_DATABASE = "database_name"
-MONGO_COLLECTION = "target_collection"
-
-MONGO_KEY_FIELD = "xmlIdentifier"
-MONGO_VALUE_FIELD = "newRelationshipValue"
-
-
-# Do not perform database writes while True.
+# Keep this True until the printed mappings are verified.
 DRY_RUN = True
 
 
-# Commit PostgreSQL updates every N successfully processed XML files.
-POSTGRES_COMMIT_BATCH_SIZE = 100
+# ============================================================
+# TWO-STAGE LOOKUP CONFIGURATION
+# ============================================================
+
+# Stage 1:
+#
+# A recognizable substring in the Jenkins job name maps to an
+# intermediate integer ID.
+#
+# Example:
+#
+# Jenkins job name:
+#     "Production ABC-Customer XML Export"
+#
+# Partial-match lookup:
+#     "ABC-Customer" -> 101
+#
+JOB_NAME_INTERMEDIATE_ID_LOOKUP = {
+    "ABC-Customer": 101,
+    "DEF-Customer": 102,
+    "Some Other Recognizable Key": 103,
+}
+
+
+# Stage 2:
+#
+# The intermediate integer ID maps exactly to the final TargetID.
+# This final TargetID is written to PostgreSQL and MongoDB.
+#
+INTERMEDIATE_ID_TARGET_ID_LOOKUP = {
+    101: 12345,
+    102: 67890,
+    103: 24680,
+}
+
+
+# When True, the partial job-name comparison ignores:
+#
+# - capitalization
+# - spaces
+# - hyphens
+# - underscores
+# - punctuation
+#
+# For example:
+#
+#   "ABC-Customer"
+#   "abc_customer"
+#   "ABC Customer"
+#
+# all normalize to the same comparison value.
+NORMALIZE_LOOKUP_MATCHING = True
 
 
 # ============================================================
-# XML EXTRACTION
+# POSTGRESQL CONFIGURATION
 # ============================================================
 
-def strip_namespace(tag):
-    """
-    Convert:
+POSTGRES_HOST = "postgres-host"
+POSTGRES_PORT = 5432
+POSTGRES_DATABASE = "database-name"
+POSTGRES_USER = "database-user"
+POSTGRES_PASSWORD = "database-password"
 
-        {http://example.com/schema}Identifier
+POSTGRES_SCHEMA = "public"
+POSTGRES_TABLE = "target_table"
 
-    into:
+# Existing column containing the full XML filename.
+POSTGRES_FILENAME_COLUMN = "filename"
 
-        Identifier
-    """
-    if "}" in tag:
-        return tag.split("}", 1)[1]
-
-    return tag
-
-
-def find_element_text(root, element_name):
-    """
-    Find the first XML element with a matching local tag name.
-
-    This works with both namespaced and non-namespaced XML.
-    """
-    for element in root.iter():
-        if strip_namespace(element.tag) == element_name:
-            if element.text is not None:
-                return element.text.strip()
-
-    return None
+# Existing column that should receive the final TargetID.
+POSTGRES_TARGET_ID_COLUMN = "target_id"
 
 
-def extract_update_data(xml_path, inventory_context):
-    """
-    Extract the database lookup key and the value to write.
+# ============================================================
+# MONGODB CONFIGURATION
+# ============================================================
 
-    Customize this function based on the structure of your XML.
+MONGO_URI = "mongodb://mongo-user:mongo-password@mongo-host:27017/"
+MONGO_DATABASE = "database-name"
+MONGO_COLLECTION = "target_collection"
 
-    inventory_context contains values such as:
-        viewName
-        jobName
-        fileName
-        xmlFolderUrl
-        xmlUrl
-    """
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
+# First Mongo match field. Its value is always the same.
+MONGO_CONSTANT_MATCH_FIELD = "recordType"
+MONGO_CONSTANT_MATCH_VALUE = "some-hardcoded-value"
 
-    # --------------------------------------------------------
-    # CUSTOMIZE THIS
-    # --------------------------------------------------------
+# Second and third Mongo match fields.
+# Their values are extracted from the XML filename.
+MONGO_SUBSTRING_A_FIELD = "fieldA"
+MONGO_SUBSTRING_B_FIELD = "fieldB"
 
-    # Example:
-    #
-    # <Document>
-    #     <Identifier>ABC-123</Identifier>
-    # </Document>
-    #
-    lookup_key = find_element_text(root, "Identifier")
-
-    # In your case, the new value may come from the Jenkins job/folder name.
-    new_value = inventory_context["jobName"]
-
-    # Alternatively, the new value could come from the XML:
-    #
-    # new_value = find_element_text(root, "RelationshipValue")
-
-    if not lookup_key:
-        raise ValueError(
-            "Could not find Identifier in XML: {}".format(xml_path)
-        )
-
-    if not new_value:
-        raise ValueError(
-            "Could not determine relationship value for: {}".format(xml_path)
-        )
-
-    return {
-        "lookupKey": lookup_key,
-        "newValue": new_value,
-    }
+# New field to add or overwrite with the final TargetID.
+MONGO_TARGET_ID_FIELD = "targetId"
 
 
 # ============================================================
@@ -140,23 +126,21 @@ def load_inventory():
         return json.load(input_file)
 
 
-def iterate_inventory_xml_files(inventory):
+def iterate_inventory_records(inventory):
     """
-    Iterate over the JSON structure produced by the Jenkins inventory script.
-
-    Expected shape:
+    Expected Jenkins inventory shape:
 
     {
         "views": [
             {
-                "viewName": "...",
+                "viewName": "View One",
                 "jobs": [
                     {
-                        "jobName": "...",
+                        "jobName": "Some Jenkins Job",
                         "xmlFiles": [
                             {
-                                "fileName": "...",
-                                "url": "..."
+                                "fileName": "Prefix-ValueA_ValueB-End.XML",
+                                "url": "http://..."
                             }
                         ]
                     }
@@ -164,84 +148,304 @@ def iterate_inventory_xml_files(inventory):
             }
         ]
     }
+
+    The XML files themselves are never opened or downloaded.
+    Only jobName and fileName are used.
     """
     for view_record in inventory.get("views", []):
         view_name = view_record.get("viewName")
 
         for job_record in view_record.get("jobs", []):
             job_name = job_record.get("jobName")
-            xml_folder_url = job_record.get("xmlFolderUrl")
 
             for xml_record in job_record.get("xmlFiles", []):
                 file_name = xml_record.get("fileName")
 
+                if not job_name:
+                    print(
+                        "Skipping inventory record with no jobName",
+                        file=sys.stderr,
+                    )
+                    continue
+
                 if not file_name:
+                    print(
+                        "Skipping inventory record with no fileName",
+                        file=sys.stderr,
+                    )
                     continue
 
                 yield {
                     "viewName": view_name,
                     "jobName": job_name,
                     "fileName": file_name,
-                    "xmlFolderUrl": xml_folder_url,
                     "xmlUrl": xml_record.get("url"),
-                    "relativeHref": xml_record.get("relativeHref"),
                 }
 
 
-def find_local_xml_file(context):
+# ============================================================
+# STAGE 1 AND STAGE 2 LOOKUP LOGIC
+# ============================================================
+
+def normalize_lookup_value(value):
+    if value is None:
+        return ""
+
+    value = value.lower()
+
+    if NORMALIZE_LOOKUP_MATCHING:
+        value = re.sub(r"[^a-z0-9]", "", value)
+
+    return value
+
+
+def resolve_target_id(job_name):
     """
-    Resolve an inventory XML record to a local file.
+    Resolve the final TargetID through two lookup stages.
 
-    This tries several likely layouts:
+    Stage 1:
+        Partially match a lookup key against the Jenkins job name.
 
-        XML_ROOT/file.xml
-        XML_ROOT/ViewName/file.xml
-        XML_ROOT/ViewName/JobName/file.xml
-        XML_ROOT/JobName/file.xml
+    Stage 2:
+        Use the resulting intermediate integer ID as an exact key
+        in INTERMEDIATE_ID_TARGET_ID_LOOKUP.
 
-    Adjust this if your export uses a different directory structure.
+    The longest matching stage-1 key wins.
+
+    Returns:
+
+        {
+            "lookupKey": "ABC-Customer",
+            "intermediateId": 101,
+            "targetId": 12345
+        }
+
+    Returns None if no stage-1 lookup key matches.
     """
-    file_name = context["fileName"]
-    view_name = context.get("viewName")
-    job_name = context.get("jobName")
+    normalized_job_name = normalize_lookup_value(job_name)
 
-    candidates = [
-        os.path.join(XML_ROOT_DIRECTORY, file_name),
+    matches = []
+
+    for lookup_key, intermediate_id in (
+        JOB_NAME_INTERMEDIATE_ID_LOOKUP.items()
+    ):
+        normalized_key = normalize_lookup_value(lookup_key)
+
+        if normalized_key and normalized_key in normalized_job_name:
+            matches.append({
+                "lookupKey": lookup_key,
+                "normalizedLength": len(normalized_key),
+                "intermediateId": intermediate_id,
+            })
+
+    if not matches:
+        return None
+
+    # Prefer the longest matching key.
+    #
+    # This protects against cases such as:
+    #
+    #     "Customer"
+    #     "Customer-East"
+    #
+    # where both could match the same job name.
+    matches.sort(
+        key=lambda item: item["normalizedLength"],
+        reverse=True,
+    )
+
+    best_match = matches[0]
+
+    equally_specific_matches = [
+        match
+        for match in matches
+        if match["normalizedLength"] == best_match["normalizedLength"]
     ]
 
-    if view_name:
-        candidates.append(
-            os.path.join(
-                XML_ROOT_DIRECTORY,
-                view_name,
-                file_name,
-            )
-        )
+    equally_specific_ids = set(
+        match["intermediateId"]
+        for match in equally_specific_matches
+    )
 
-    if job_name:
-        candidates.append(
-            os.path.join(
-                XML_ROOT_DIRECTORY,
+    if len(equally_specific_ids) > 1:
+        raise ValueError(
+            "Ambiguous stage-1 lookup for job {!r}: {}".format(
                 job_name,
-                file_name,
+                [
+                    {
+                        "lookupKey": match["lookupKey"],
+                        "intermediateId": match["intermediateId"],
+                    }
+                    for match in equally_specific_matches
+                ],
             )
         )
 
-    if view_name and job_name:
-        candidates.append(
-            os.path.join(
-                XML_ROOT_DIRECTORY,
-                view_name,
-                job_name,
-                file_name,
+    intermediate_id = best_match["intermediateId"]
+
+    if intermediate_id not in INTERMEDIATE_ID_TARGET_ID_LOOKUP:
+        raise ValueError(
+            "Intermediate ID {!r} from lookup key {!r} has no "
+            "stage-2 TargetID mapping".format(
+                intermediate_id,
+                best_match["lookupKey"],
             )
         )
 
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            return candidate
+    target_id = INTERMEDIATE_ID_TARGET_ID_LOOKUP[intermediate_id]
 
-    return None
+    return {
+        "lookupKey": best_match["lookupKey"],
+        "intermediateId": intermediate_id,
+        "targetId": target_id,
+    }
+
+
+# ============================================================
+# FILENAME PARSING FOR MONGODB
+# ============================================================
+
+def remove_xml_extension(file_name):
+    if file_name.lower().endswith(".xml"):
+        return file_name[:-4]
+
+    return file_name
+
+
+def extract_mongo_match_values(file_name):
+    """
+    Mongo substring A:
+
+        After the first hyphen
+        Before the first underscore
+
+    Mongo substring B:
+
+        After the first underscore
+        Before the first hyphen occurring after that underscore
+
+    Example filename:
+
+        Prefix-ValueA_ValueB-Remainder.XML
+
+    Produces:
+
+        substring_a = "ValueA"
+        substring_b = "ValueB"
+    """
+    base_name = remove_xml_extension(file_name)
+
+    first_hyphen_index = base_name.find("-")
+
+    if first_hyphen_index == -1:
+        raise ValueError(
+            "Filename has no hyphen: {!r}".format(file_name)
+        )
+
+    first_underscore_index = base_name.find(
+        "_",
+        first_hyphen_index + 1,
+    )
+
+    if first_underscore_index == -1:
+        raise ValueError(
+            "Filename has no underscore after its first hyphen: {!r}".format(
+                file_name
+            )
+        )
+
+    next_hyphen_index = base_name.find(
+        "-",
+        first_underscore_index + 1,
+    )
+
+    if next_hyphen_index == -1:
+        raise ValueError(
+            "Filename has no hyphen after its first underscore: {!r}".format(
+                file_name
+            )
+        )
+
+    substring_a = base_name[
+        first_hyphen_index + 1:first_underscore_index
+    ]
+
+    substring_b = base_name[
+        first_underscore_index + 1:next_hyphen_index
+    ]
+
+    if not substring_a:
+        raise ValueError(
+            "Filename produced an empty Mongo substring A: {!r}".format(
+                file_name
+            )
+        )
+
+    if not substring_b:
+        raise ValueError(
+            "Filename produced an empty Mongo substring B: {!r}".format(
+                file_name
+            )
+        )
+
+    return substring_a, substring_b
+
+
+# ============================================================
+# PREPARE UPDATE RECORD
+# ============================================================
+
+def build_update_record(inventory_record):
+    job_name = inventory_record["jobName"]
+    file_name = inventory_record["fileName"]
+
+    lookup_result = resolve_target_id(job_name)
+
+    if lookup_result is None:
+        raise ValueError(
+            "No stage-1 job-name lookup matched {!r}".format(job_name)
+        )
+
+    substring_a, substring_b = extract_mongo_match_values(
+        file_name
+    )
+
+    return {
+        "viewName": inventory_record.get("viewName"),
+        "jobName": job_name,
+        "fileName": file_name,
+        "xmlUrl": inventory_record.get("xmlUrl"),
+
+        # Stage 1 result.
+        "lookupKey": lookup_result["lookupKey"],
+        "intermediateId": lookup_result["intermediateId"],
+
+        # Stage 2 result.
+        # This is the value written to both databases.
+        "targetId": lookup_result["targetId"],
+
+        # Mongo filter values parsed from the filename.
+        "mongoSubstringA": substring_a,
+        "mongoSubstringB": substring_b,
+    }
+
+
+# ============================================================
+# BATCH GENERATION
+# ============================================================
+
+def generate_batches(records, batch_size):
+    batch = []
+
+    for record in records:
+        batch.append(record)
+
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+
+    if batch:
+        yield batch
 
 
 # ============================================================
@@ -261,200 +465,361 @@ def open_postgres_connection():
 def open_mongo_connection():
     client = MongoClient(MONGO_URI)
 
-    database = client[MONGO_DATABASE]
-    collection = database[MONGO_COLLECTION]
+    collection = client[
+        MONGO_DATABASE
+    ][
+        MONGO_COLLECTION
+    ]
 
     return client, collection
 
 
 # ============================================================
-# DATABASE UPDATES
+# POSTGRESQL BATCH UPDATE
 # ============================================================
 
-def update_postgres(cursor, lookup_key, new_value):
+def run_postgres_batch(cursor, batch):
     """
-    Uses parameterized values to avoid SQL injection.
+    For every batch record, perform the conceptual update:
 
-    Table and column names cannot be passed as regular query parameters,
-    so they are constants defined above.
+        UPDATE target_table
+        SET target_id = final_target_id
+        WHERE filename = xml_filename
+
+    execute_values builds one VALUES-based batch statement rather
+    than issuing one SQL command per filename.
     """
+    values = [
+        (
+            record["fileName"],
+            record["targetId"],
+        )
+        for record in batch
+    ]
+
     query = """
-        UPDATE {table}
-        SET {value_column} = %s
-        WHERE {key_column} = %s
+        UPDATE {schema}.{table} AS target
+        SET {target_id_column} = incoming.target_id
+        FROM (
+            VALUES %s
+        ) AS incoming(file_name, target_id)
+        WHERE target.{filename_column} = incoming.file_name
     """.format(
+        schema=POSTGRES_SCHEMA,
         table=POSTGRES_TABLE,
-        value_column=POSTGRES_VALUE_COLUMN,
-        key_column=POSTGRES_KEY_COLUMN,
+        target_id_column=POSTGRES_TARGET_ID_COLUMN,
+        filename_column=POSTGRES_FILENAME_COLUMN,
     )
 
-    cursor.execute(
+    execute_values(
+        cursor,
         query,
-        (
-            new_value,
-            lookup_key,
-        ),
+        values,
+        template="(%s, %s)",
     )
 
     return cursor.rowcount
 
 
-def update_mongo(collection, lookup_key, new_value):
-    result = collection.update_many(
-        {
-            MONGO_KEY_FIELD: lookup_key,
-        },
-        {
-            "$set": {
-                MONGO_VALUE_FIELD: new_value,
-            }
-        },
-    )
-
-    return result.matched_count, result.modified_count
-
-
 # ============================================================
-# PROCESSING
+# MONGODB BATCH UPDATE
 # ============================================================
 
-def process_xml_file(
-    xml_path,
-    context,
-    postgres_cursor,
-    mongo_collection,
-):
-    update_data = extract_update_data(
-        xml_path,
-        context,
-    )
+def build_mongo_operations(batch):
+    """
+    Each operation matches three fields:
 
-    lookup_key = update_data["lookupKey"]
-    new_value = update_data["newValue"]
+        1. A constant field/value.
+        2. Filename-derived substring A.
+        3. Filename-derived substring B.
 
-    print(
-        "XML: {} | key={} | value={}".format(
-            xml_path,
-            lookup_key,
-            new_value,
-        )
-    )
+    It then adds or replaces the configured TargetID field.
+    """
+    operations = []
 
-    if DRY_RUN:
-        return {
-            "postgresMatched": 0,
-            "mongoMatched": 0,
-            "mongoModified": 0,
+    for record in batch:
+        mongo_filter = {
+            MONGO_CONSTANT_MATCH_FIELD: MONGO_CONSTANT_MATCH_VALUE,
+            MONGO_SUBSTRING_A_FIELD: record["mongoSubstringA"],
+            MONGO_SUBSTRING_B_FIELD: record["mongoSubstringB"],
         }
 
-    postgres_matched = update_postgres(
-        postgres_cursor,
-        lookup_key,
-        new_value,
-    )
+        mongo_update = {
+            "$set": {
+                MONGO_TARGET_ID_FIELD: record["targetId"],
+            }
+        }
 
-    mongo_matched, mongo_modified = update_mongo(
-        mongo_collection,
-        lookup_key,
-        new_value,
+        operations.append(
+            UpdateOne(
+                mongo_filter,
+                mongo_update,
+                upsert=False,
+            )
+        )
+
+    return operations
+
+
+def run_mongo_batch(collection, batch):
+    operations = build_mongo_operations(batch)
+
+    if not operations:
+        return {
+            "matched": 0,
+            "modified": 0,
+            "upserted": 0,
+        }
+
+    result = collection.bulk_write(
+        operations,
+        ordered=False,
     )
 
     return {
-        "postgresMatched": postgres_matched,
-        "mongoMatched": mongo_matched,
-        "mongoModified": mongo_modified,
+        "matched": result.matched_count,
+        "modified": result.modified_count,
+        "upserted": len(result.upserted_ids),
     }
 
+
+# ============================================================
+# DRY-RUN DISPLAY
+# ============================================================
+
+def print_batch_preview(batch, batch_number):
+    print("")
+    print(
+        "DRY RUN - batch {} containing {} record(s)".format(
+            batch_number,
+            len(batch),
+        )
+    )
+
+    for record in batch:
+        print(
+            "  file={!r} | "
+            "job={!r} | "
+            "lookupKey={!r} | "
+            "intermediateId={!r} | "
+            "targetId={!r} | "
+            "mongoA={!r} | "
+            "mongoB={!r}".format(
+                record["fileName"],
+                record["jobName"],
+                record["lookupKey"],
+                record["intermediateId"],
+                record["targetId"],
+                record["mongoSubstringA"],
+                record["mongoSubstringB"],
+            )
+        )
+
+
+# ============================================================
+# OPTIONAL DUPLICATE VALIDATION
+# ============================================================
+
+def validate_prepared_records(records):
+    """
+    Detect conflicting duplicate update instructions.
+
+    A duplicate filename is acceptable only if every occurrence maps
+    to the same final TargetID.
+
+    A duplicate Mongo filter is acceptable only if every occurrence
+    maps to the same final TargetID.
+    """
+    postgres_targets = {}
+    mongo_targets = {}
+
+    for record in records:
+        file_name = record["fileName"]
+        target_id = record["targetId"]
+
+        if file_name in postgres_targets:
+            previous_target_id = postgres_targets[file_name]
+
+            if previous_target_id != target_id:
+                raise ValueError(
+                    "Conflicting PostgreSQL mappings for filename {!r}: "
+                    "{!r} and {!r}".format(
+                        file_name,
+                        previous_target_id,
+                        target_id,
+                    )
+                )
+        else:
+            postgres_targets[file_name] = target_id
+
+        mongo_key = (
+            MONGO_CONSTANT_MATCH_VALUE,
+            record["mongoSubstringA"],
+            record["mongoSubstringB"],
+        )
+
+        if mongo_key in mongo_targets:
+            previous_target_id = mongo_targets[mongo_key]
+
+            if previous_target_id != target_id:
+                raise ValueError(
+                    "Conflicting Mongo mappings for filter {!r}: "
+                    "{!r} and {!r}".format(
+                        mongo_key,
+                        previous_target_id,
+                        target_id,
+                    )
+                )
+        else:
+            mongo_targets[mongo_key] = target_id
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
     inventory = load_inventory()
 
-    postgres_connection = None
-    postgres_cursor = None
-    mongo_client = None
+    prepared_records = []
 
     totals = {
         "inventoryRecords": 0,
-        "processed": 0,
-        "missingFiles": 0,
-        "errors": 0,
+        "preparedRecords": 0,
+        "skippedRecords": 0,
+        "batches": 0,
         "postgresMatched": 0,
         "mongoMatched": 0,
         "mongoModified": 0,
+        "mongoUpserted": 0,
     }
 
+    print("Reading Jenkins inventory...")
+
+    for inventory_record in iterate_inventory_records(inventory):
+        totals["inventoryRecords"] += 1
+
+        try:
+            update_record = build_update_record(
+                inventory_record
+            )
+
+            prepared_records.append(update_record)
+            totals["preparedRecords"] += 1
+
+        except Exception as error:
+            totals["skippedRecords"] += 1
+
+            print(
+                "SKIPPED: file={!r}, job={!r}, reason={}".format(
+                    inventory_record.get("fileName"),
+                    inventory_record.get("jobName"),
+                    error,
+                ),
+                file=sys.stderr,
+            )
+
+    print(
+        "Prepared {} update record(s).".format(
+            len(prepared_records)
+        )
+    )
+
+    # Stop before database work if contradictory duplicate mappings
+    # were generated.
+    validate_prepared_records(prepared_records)
+
+    postgres_connection = None
+    postgres_cursor = None
+    mongo_client = None
+    mongo_collection = None
+
     try:
-        if not DRY_RUN:
+        if DRY_RUN:
+            print(
+                "DRY_RUN is enabled. No database changes will be made."
+            )
+        else:
             postgres_connection = open_postgres_connection()
             postgres_cursor = postgres_connection.cursor()
 
             mongo_client, mongo_collection = open_mongo_connection()
-        else:
-            mongo_collection = None
-            print("DRY_RUN is enabled. No database changes will be made.")
 
-        for context in iterate_inventory_xml_files(inventory):
-            totals["inventoryRecords"] += 1
+        batches = generate_batches(
+            prepared_records,
+            BATCH_SIZE,
+        )
 
-            xml_path = find_local_xml_file(context)
+        for batch_number, batch in enumerate(
+            batches,
+            start=1,
+        ):
+            totals["batches"] += 1
 
-            if xml_path is None:
-                totals["missingFiles"] += 1
-
-                print(
-                    "MISSING: view={} job={} file={}".format(
-                        context.get("viewName"),
-                        context.get("jobName"),
-                        context.get("fileName"),
-                    )
+            if DRY_RUN:
+                print_batch_preview(
+                    batch,
+                    batch_number,
                 )
-
                 continue
 
+            print("")
+            print(
+                "Running batch {} containing {} record(s)...".format(
+                    batch_number,
+                    len(batch),
+                )
+            )
+
             try:
-                result = process_xml_file(
-                    xml_path,
-                    context,
+                # PostgreSQL changes remain uncommitted until after
+                # the Mongo batch succeeds.
+                postgres_matched = run_postgres_batch(
                     postgres_cursor,
-                    mongo_collection,
+                    batch,
                 )
 
-                totals["processed"] += 1
-                totals["postgresMatched"] += result["postgresMatched"]
-                totals["mongoMatched"] += result["mongoMatched"]
-                totals["mongoModified"] += result["mongoModified"]
+                mongo_result = run_mongo_batch(
+                    mongo_collection,
+                    batch,
+                )
 
-                if (
-                    not DRY_RUN
-                    and totals["processed"] % POSTGRES_COMMIT_BATCH_SIZE == 0
-                ):
-                    postgres_connection.commit()
+                postgres_connection.commit()
 
-                    print(
-                        "Committed PostgreSQL batch at {} processed files".format(
-                            totals["processed"]
-                        )
-                    )
-
-            except Exception as error:
-                totals["errors"] += 1
+                totals["postgresMatched"] += postgres_matched
+                totals["mongoMatched"] += mongo_result["matched"]
+                totals["mongoModified"] += mongo_result["modified"]
+                totals["mongoUpserted"] += mongo_result["upserted"]
 
                 print(
-                    "ERROR processing {}: {}".format(
-                        xml_path,
-                        error,
+                    "  PostgreSQL rows matched: {}".format(
+                        postgres_matched
+                    )
+                )
+
+                print(
+                    "  Mongo documents matched: {}".format(
+                        mongo_result["matched"]
+                    )
+                )
+
+                print(
+                    "  Mongo documents modified: {}".format(
+                        mongo_result["modified"]
+                    )
+                )
+
+            except Exception:
+                postgres_connection.rollback()
+
+                print(
+                    "Batch {} failed. PostgreSQL was rolled back.".format(
+                        batch_number
                     ),
                     file=sys.stderr,
                 )
 
-        if not DRY_RUN:
-            postgres_connection.commit()
-
-    except Exception:
-        if postgres_connection is not None:
-            postgres_connection.rollback()
-
-        raise
+                raise
 
     finally:
         if postgres_cursor is not None:
@@ -468,13 +833,41 @@ def main():
 
     print("")
     print("Finished")
-    print("Inventory records: {}".format(totals["inventoryRecords"]))
-    print("XML files processed: {}".format(totals["processed"]))
-    print("Missing XML files: {}".format(totals["missingFiles"]))
-    print("Errors: {}".format(totals["errors"]))
-    print("PostgreSQL rows matched: {}".format(totals["postgresMatched"]))
-    print("Mongo documents matched: {}".format(totals["mongoMatched"]))
-    print("Mongo documents modified: {}".format(totals["mongoModified"]))
+    print(
+        "Inventory records: {}".format(
+            totals["inventoryRecords"]
+        )
+    )
+    print(
+        "Prepared records: {}".format(
+            totals["preparedRecords"]
+        )
+    )
+    print(
+        "Skipped records: {}".format(
+            totals["skippedRecords"]
+        )
+    )
+    print(
+        "Batches: {}".format(
+            totals["batches"]
+        )
+    )
+    print(
+        "PostgreSQL rows matched: {}".format(
+            totals["postgresMatched"]
+        )
+    )
+    print(
+        "Mongo documents matched: {}".format(
+            totals["mongoMatched"]
+        )
+    )
+    print(
+        "Mongo documents modified: {}".format(
+            totals["mongoModified"]
+        )
+    )
 
 
 if __name__ == "__main__":
